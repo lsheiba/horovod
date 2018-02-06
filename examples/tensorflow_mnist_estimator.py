@@ -144,8 +144,12 @@ def main(unused_argv):
 
     # Horovod: save checkpoints only on worker 0 to prevent other workers from
     # corrupting them.
-    model_dir = './mnist_convnet_model' if hvd.rank() == 0 else None
-
+    # model_dir = './mnist_convnet_model' if hvd.rank() == 0 else None
+    model_dir = os.environ['TRAINING_DIR']+os.sep+os.environ['BUILD_ID'] if hvd.rank() == 0 else None
+    if model_dir is not None:
+        if not tf.gfile.Exists(model_dir):
+            tf.gfile.MakeDirs(model_dir)
+            
     # Create the Estimator
     mnist_classifier = tf.estimator.Estimator(
         model_fn=cnn_model_fn, model_dir=model_dir,
