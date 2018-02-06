@@ -106,7 +106,7 @@ def main(_):
 
     # Horovod: save checkpoints only on worker 0 to prevent other workers from
     # corrupting them.
-    checkpoint_dir = os.environ['TRAINING_DIR'] if hvd.rank() == 0 else None
+    checkpoint_dir = os.environ['TRAINING_DIR']+os.sep+os.environ['BUILD_ID'] if hvd.rank() == 0 else None
 
     # The MonitoredTrainingSession takes care of session initialization,
     # restoring from a checkpoint, saving to a checkpoint, and closing when done
