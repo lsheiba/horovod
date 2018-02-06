@@ -108,8 +108,9 @@ def main(_):
     # Horovod: save checkpoints only on worker 0 to prevent other workers from
     # corrupting them.
     checkpoint_dir = os.environ['TRAINING_DIR']+os.sep+os.environ['BUILD_ID'] if hvd.rank() == 0 else None
-    if not tf.gfile.Exists(checkpoint_dir):
-        tf.gfile.MakeDirs(checkpoint_dir)
+    if checkpoint_dir is not None:
+        if not tf.gfile.Exists(checkpoint_dir):
+            tf.gfile.MakeDirs(checkpoint_dir)
 
     # The MonitoredTrainingSession takes care of session initialization,
     # restoring from a checkpoint, saving to a checkpoint, and closing when done
