@@ -29,15 +29,16 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow as tf
+from horovod.common import check_extension
 
-from horovod.tensorflow.mpi_ops import size
-from horovod.tensorflow.mpi_ops import rank
-from horovod.tensorflow.mpi_ops import local_rank
-from horovod.tensorflow.mpi_ops import allgather
-from horovod.tensorflow.mpi_ops import broadcast
-from horovod.tensorflow.mpi_ops import _allreduce
-from horovod.tensorflow.mpi_ops import init
+check_extension('horovod.tensorflow', 'HOROVOD_WITH_TENSORFLOW', __file__, 'mpi_lib')
+
+from horovod.tensorflow.mpi_ops import allgather, broadcast, _allreduce
+from horovod.tensorflow.mpi_ops import init, shutdown
+from horovod.tensorflow.mpi_ops import size, local_size, rank, local_rank
+from horovod.tensorflow.mpi_ops import mpi_threads_supported
+
+import tensorflow as tf
 
 
 def allreduce(tensor, average=True, device_dense='', device_sparse=''):
@@ -116,7 +117,7 @@ class BroadcastGlobalVariablesHook(tf.train.SessionRunHook):
         self.device = device
 
     def begin(self):
-        if not self.bcast_op:
+        if not self.bcast_op or self.bcast_op.graph != tf.get_default_graph():
             with tf.device(self.device):
                 self.bcast_op = broadcast_global_variables(self.root_rank)
 
@@ -169,8 +170,7 @@ class DistributedOptimizer(tf.train.Optimizer):
         In DistributedOptimizer, compute_gradients() is overriden to also
         allreduce the gradients before returning them.
         """
-        gradients = (super(DistributedOptimizer, self)
-                     .compute_gradients(*args, **kwargs))
+        gradients = self._optimizer.compute_gradients(*args, **kwargs)
         if size() > 1:
             averaged_gradients = []
             with tf.name_scope(self._name + "_Allreduce"):
@@ -185,42 +185,18 @@ class DistributedOptimizer(tf.train.Optimizer):
         else:
             return gradients
 
-    def _apply_dense(self, *args, **kwargs):
+    def apply_gradients(self, *args, **kwargs):
         """Calls this same method on the underlying optimizer."""
-        return self._optimizer._apply_dense(*args, **kwargs)
+        return self._optimizer.apply_gradients(*args, **kwargs)
 
-    def _resource_apply_dense(self, *args, **kwargs):
+    def get_slot(self, *args, **kwargs):
         """Calls this same method on the underlying optimizer."""
-        return self._optimizer._resource_apply_dense(*args, **kwargs)
+        return self._optimizer.get_slot(*args, **kwargs)
 
-    def _resource_apply_sparse_duplicate_indices(self, *args, **kwargs):
+    def get_slot_names(self, *args, **kwargs):
         """Calls this same method on the underlying optimizer."""
-        return self._optimizer._resource_apply_sparse_duplicate_indices(*args, **kwargs)
+        return self._optimizer.get_slot_names(*args, **kwargs)
 
-    def _resource_apply_sparse(self, *args, **kwargs):
+    def variables(self, *args, **kwargs):
         """Calls this same method on the underlying optimizer."""
-        return self._optimizer._resource_apply_sparse(*args, **kwargs)
-
-    def _apply_sparse_duplicate_indices(self, *args, **kwargs):
-        """Calls this same method on the underlying optimizer."""
-        return self._optimizer._apply_sparse_duplicate_indices(*args, **kwargs)
-
-    def _apply_sparse(self, *args, **kwargs):
-        """Calls this same method on the underlying optimizer."""
-        return self._optimizer._apply_sparse(*args, **kwargs)
-
-    def _prepare(self, *args, **kwargs):
-        """Calls this same method on the underlying optimizer."""
-        return self._optimizer._prepare(*args, **kwargs)
-
-    def _create_slots(self, *args, **kwargs):
-        """Calls this same method on the underlying optimizer."""
-        return self._optimizer._create_slots(*args, **kwargs)
-
-    def _valid_dtypes(self, *args, **kwargs):
-        """Calls this same method on the underlying optimizer."""
-        return self._optimizer._valid_dtypes(*args, **kwargs)
-
-    def _finish(self, *args, **kwargs):
-        """Calls this same method on the underlying optimizer."""
-        return self._optimizer._finish(*args, **kwargs)
+        return self._optimizer.variables(*args, **kwargs)

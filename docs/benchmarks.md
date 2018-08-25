@@ -1,9 +1,9 @@
 ## Benchmarks
 
-![128-GPU Benchmark](https://user-images.githubusercontent.com/16640218/31681220-7453e760-b32b-11e7-9ba3-6d01f83b7748.png)
+![512-GPU Benchmark](https://user-images.githubusercontent.com/16640218/38965607-bf5c46ca-4332-11e8-895a-b9c137e86013.png)
 
-The above benchmark was done on 32 servers with 4 Pascal GPUs each connected by RoCE-capable 25 Gbit/s network. Horovod
-achieves 90% scaling efficiency for both Inception V3 and ResNet-101, and 79% scaling efficiency for VGG-16.
+The above benchmark was done on 128 servers with 4 Pascal GPUs each connected by RoCE-capable 25 Gbit/s network. Horovod
+achieves 90% scaling efficiency for both Inception V3 and ResNet-101, and 68% scaling efficiency for VGG-16.
 
 To reproduce the benchmarks:
 
@@ -18,28 +18,12 @@ $ cd benchmarks
 
 3. Run the benchmark. Examples below are for Open MPI.
 
-    1. If you have a network with RoCE / InfiniBand (recommended):
-    
     ```bash
     $ mpirun -np 16 \
         -H server1:4,server2:4,server3:4,server4:4 \
         -bind-to none -map-by slot \
-        -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH \
-        -mca pml ob1 -mca btl_openib_receive_queues P,128,32:P,2048,32:P,12288,32:P,65536,32 \
-        \
-        python scripts/tf_cnn_benchmarks/tf_cnn_benchmarks.py \
-            --model resnet101 \
-            --batch_size 64 \
-            --variable_update horovod
-    ```
-
-    2. If you have a plain TCP network:
-    
-    ```bash
-    $ mpirun -np 16 \
-        -H server1:4,server2:4,server3:4,server4:4 \
-        -bind-to none -map-by slot \
-        -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH \
+        -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH -x PATH \
+        -mca pml ob1 -mca btl ^openib \
         \
         python scripts/tf_cnn_benchmarks/tf_cnn_benchmarks.py \
             --model resnet101 \
@@ -62,31 +46,12 @@ and convert it using the TFRecord [preprocessing script](https://github.com/tens
 
 Now, simply add `--data_dir /path/to/imagenet/tfrecords --data_name imagenet --num_batches=2000` to your training command:
 
-1. If you have a network with RoCE / InfiniBand (recommended):
-
 ```bash
 $ mpirun -np 16 \
     -H server1:4,server2:4,server3:4,server4:4 \
     -bind-to none -map-by slot \
-    -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH \
-    -mca pml ob1 -mca btl_openib_receive_queues P,128,32:P,2048,32:P,12288,32:P,65536,32 \
-    \
-    python scripts/tf_cnn_benchmarks/tf_cnn_benchmarks.py \
-        --model resnet101 \
-        --batch_size 64 \
-        --variable_update horovod \
-        --data_dir /path/to/imagenet/tfrecords \
-        --data_name imagenet \
-        --num_batches=2000
-```
-
-2. If you have a plain TCP network:
-
-```bash
-$ mpirun -np 16 \
-    -H server1:4,server2:4,server3:4,server4:4 \
-    -bind-to none -map-by slot \
-    -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH \
+    -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH -x PATH \
+    -mca pml ob1 -mca btl ^openib \
     \
     python scripts/tf_cnn_benchmarks/tf_cnn_benchmarks.py \
         --model resnet101 \

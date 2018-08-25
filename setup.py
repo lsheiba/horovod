@@ -12,20 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from __future__ import print_function
+
 import os
-from distutils.errors import CompileError, DistutilsError, DistutilsPlatformError, LinkError
 from setuptools import setup, Extension, find_packages
 from setuptools.command.build_ext import build_ext
+from distutils.errors import CompileError, DistutilsError, DistutilsPlatformError, LinkError
 import shlex
 import subprocess
 import sys
 import textwrap
 import traceback
+import re
 
 from horovod import __version__
 
 
 tensorflow_mpi_lib = Extension('horovod.tensorflow.mpi_lib', [])
+torch_mpi_lib = Extension('horovod.torch.mpi_lib', [])
+torch_mpi_lib_impl = Extension('horovod.torch.mpi_lib_impl', [])
+
+
+def is_build_action():
+    if len(sys.argv) <= 1:
+        return False
+
+    if sys.argv[1].startswith('build'):
+        return True
+
+    if sys.argv[1].startswith('bdist'):
+        return True
+
+    if sys.argv[1].startswith('install'):
+        return True
 
 
 def check_tf_version():
@@ -149,7 +168,8 @@ def get_tf_flags(build_ext, cpp_flags):
         tf_include_dirs = get_tf_include_dirs()
         tf_lib_dirs = get_tf_lib_dirs()
         tf_libs = get_tf_libs(build_ext, tf_lib_dirs, cpp_flags)
-        tf_abi = get_tf_abi(build_ext, tf_include_dirs, tf_lib_dirs, tf_libs, cpp_flags)
+        tf_abi = get_tf_abi(build_ext, tf_include_dirs,
+                            tf_lib_dirs, tf_libs, cpp_flags)
 
         compile_flags = []
         for include_dir in tf_include_dirs:
@@ -252,25 +272,32 @@ def get_cuda_dirs(build_ext, cpp_flags):
     return cuda_include_dirs, cuda_lib_dirs
 
 
-def get_nccl_dirs(build_ext, cuda_include_dirs, cuda_lib_dirs, cpp_flags):
+def get_nccl_vals(build_ext, cuda_include_dirs, cuda_lib_dirs, cpp_flags):
     nccl_include_dirs = []
     nccl_lib_dirs = []
+    nccl_libs = []
 
     nccl_home = os.environ.get('HOROVOD_NCCL_HOME')
     if nccl_home:
         nccl_include_dirs += ['%s/include' % nccl_home]
         nccl_lib_dirs += ['%s/lib' % nccl_home, '%s/lib64' % nccl_home]
 
-    nccl_include = os.environ.get('HOROVOD_NCCL_INCLUDE')
-    if nccl_include:
-        nccl_include_dirs += [nccl_include]
+    nccl_include_dir = os.environ.get('HOROVOD_NCCL_INCLUDE')
+    if nccl_include_dir:
+        nccl_include_dirs += [nccl_include_dir]
 
-    nccl_lib = os.environ.get('HOROVOD_NCCL_LIB')
-    if nccl_lib:
-        nccl_lib_dirs += [nccl_lib]
+    nccl_lib_dir = os.environ.get('HOROVOD_NCCL_LIB')
+    if nccl_lib_dir:
+        nccl_lib_dirs += [nccl_lib_dir]
+
+    nccl_link_mode = os.environ.get('HOROVOD_NCCL_LINK', 'STATIC')
+    if nccl_link_mode.upper() == 'SHARED':
+        nccl_libs += ['nccl']
+    else:
+        nccl_libs += ['nccl_static']
 
     try:
-        test_compile(build_ext, 'test_nccl', libraries=['nccl'], include_dirs=nccl_include_dirs + cuda_include_dirs,
+        test_compile(build_ext, 'test_nccl', libraries=nccl_libs, include_dirs=nccl_include_dirs + cuda_include_dirs,
                      library_dirs=nccl_lib_dirs + cuda_lib_dirs, extra_preargs=cpp_flags, code=textwrap.dedent('''\
             #include <nccl.h>
             #if NCCL_MAJOR < 2
@@ -291,20 +318,34 @@ def get_nccl_dirs(build_ext, cuda_include_dirs, cuda_lib_dirs, cpp_flags):
             'HOROVOD_NCCL_INCLUDE - path to NCCL include directory\n'
             'HOROVOD_NCCL_LIB - path to NCCL lib directory')
 
-    return nccl_include_dirs, nccl_lib_dirs
+    return nccl_include_dirs, nccl_lib_dirs, nccl_libs
 
 
-def fully_define_extension(build_ext):
-    check_tf_version()
+def get_ddl_dirs():
+    # Default DDL home
+    ddl_home = '/opt/DL/ddl'
+    ddl_include_dir = '%s/include' % ddl_home
+    ddl_lib_dir = '%s/lib' % ddl_home
 
+    if not os.path.exists(ddl_lib_dir):
+        raise DistutilsPlatformError(
+            'DDL lib was not found. Please, make sure \'ddl\' package is installed.')
+    if not os.path.exists(ddl_include_dir):
+        raise DistutilsPlatformError(
+            'DDL include was not found. Please, make sure \'ddl-dev\' package is installed.')
+
+    return [ddl_include_dir], [ddl_lib_dir]
+
+
+def get_common_options(build_ext):
     cpp_flags = get_cpp_flags(build_ext)
-    tf_compile_flags, tf_link_flags = get_tf_flags(build_ext, cpp_flags)
     mpi_flags = get_mpi_flags()
 
     gpu_allreduce = os.environ.get('HOROVOD_GPU_ALLREDUCE')
-    if gpu_allreduce and gpu_allreduce != 'MPI' and gpu_allreduce != 'NCCL':
+    if gpu_allreduce and gpu_allreduce != 'MPI' and gpu_allreduce != 'NCCL' and \
+       gpu_allreduce != 'DDL':
         raise DistutilsError('HOROVOD_GPU_ALLREDUCE=%s is invalid, supported '
-                             'values are "", "MPI", "NCCL".' % gpu_allreduce)
+                             'values are "", "MPI", "NCCL", "DDL".' % gpu_allreduce)
 
     gpu_allgather = os.environ.get('HOROVOD_GPU_ALLGATHER')
     if gpu_allgather and gpu_allgather != 'MPI':
@@ -325,19 +366,33 @@ def fully_define_extension(build_ext):
 
     if gpu_allreduce == 'NCCL':
         have_nccl = True
-        nccl_include_dirs, nccl_lib_dirs = get_nccl_dirs(
+        nccl_include_dirs, nccl_lib_dirs, nccl_libs = get_nccl_vals(
             build_ext, cuda_include_dirs, cuda_lib_dirs, cpp_flags)
     else:
         have_nccl = False
-        nccl_include_dirs = nccl_lib_dirs = []
+        nccl_include_dirs = nccl_lib_dirs = nccl_libs = []
+
+    if gpu_allreduce == 'DDL':
+        have_ddl = True
+        ddl_include_dirs, ddl_lib_dirs = get_ddl_dirs()
+    else:
+        have_ddl = False
+        ddl_include_dirs = ddl_lib_dirs = []
+
+    if (gpu_allreduce == 'NCCL' and (gpu_allgather == 'MPI' or gpu_broadcast == 'MPI')
+            and not os.environ.get('HOROVOD_ALLOW_MIXED_GPU_IMPL')):
+        raise DistutilsError('You should not mix NCCL and MPI GPU due to a possible deadlock.\n'
+                             'If you\'re sure you want to mix them, set the '
+                             'HOROVOD_ALLOW_MIXED_GPU_IMPL environment variable to \'1\'.')
 
     MACROS = []
     INCLUDES = []
-    SOURCES = ['horovod/tensorflow/mpi_message.cc',
-               'horovod/tensorflow/mpi_ops.cc',
-               'horovod/tensorflow/timeline.cc']
-    COMPILE_FLAGS = cpp_flags + shlex.split(mpi_flags) + tf_compile_flags
-    LINK_FLAGS = shlex.split(mpi_flags) + tf_link_flags
+    SOURCES = ['horovod/common/common.cc',
+               'horovod/common/mpi_message.cc',
+               'horovod/common/operations.cc',
+               'horovod/common/timeline.cc']
+    COMPILE_FLAGS = cpp_flags + shlex.split(mpi_flags)
+    LINK_FLAGS = shlex.split(mpi_flags)
     LIBRARY_DIRS = []
     LIBRARIES = []
 
@@ -350,8 +405,15 @@ def fully_define_extension(build_ext):
     if have_nccl:
         MACROS += [('HAVE_NCCL', '1')]
         INCLUDES += nccl_include_dirs
+        LINK_FLAGS += ['-Wl,--version-script=hide_nccl.lds']
         LIBRARY_DIRS += nccl_lib_dirs
-        LIBRARIES += ['nccl']
+        LIBRARIES += nccl_libs
+
+    if have_ddl:
+        MACROS += [('HAVE_DDL', '1')]
+        INCLUDES += ddl_include_dirs
+        LIBRARY_DIRS += ddl_lib_dirs
+        LIBRARIES += ['ddl', 'ddl_pack']
 
     if gpu_allreduce:
         MACROS += [('HOROVOD_GPU_ALLREDUCE', "'%s'" % gpu_allreduce[0])]
@@ -362,35 +424,231 @@ def fully_define_extension(build_ext):
     if gpu_broadcast:
         MACROS += [('HOROVOD_GPU_BROADCAST', "'%s'" % gpu_broadcast[0])]
 
-    tensorflow_mpi_lib.define_macros = MACROS
-    tensorflow_mpi_lib.include_dirs = INCLUDES
-    tensorflow_mpi_lib.sources = SOURCES
-    tensorflow_mpi_lib.extra_compile_args = COMPILE_FLAGS
-    tensorflow_mpi_lib.extra_link_args = LINK_FLAGS
-    tensorflow_mpi_lib.library_dirs = LIBRARY_DIRS
-    tensorflow_mpi_lib.libraries = LIBRARIES
+    return dict(MACROS=MACROS,
+                INCLUDES=INCLUDES,
+                SOURCES=SOURCES,
+                COMPILE_FLAGS=COMPILE_FLAGS,
+                LINK_FLAGS=LINK_FLAGS,
+                LIBRARY_DIRS=LIBRARY_DIRS,
+                LIBRARIES=LIBRARIES)
+
+
+def build_tf_extension(build_ext, options):
+    check_tf_version()
+    tf_compile_flags, tf_link_flags = get_tf_flags(
+        build_ext, options['COMPILE_FLAGS'])
+
+    tensorflow_mpi_lib.define_macros = options['MACROS']
+    tensorflow_mpi_lib.include_dirs = options['INCLUDES']
+    tensorflow_mpi_lib.sources = options['SOURCES'] + \
+        ['horovod/tensorflow/mpi_ops.cc']
+    tensorflow_mpi_lib.extra_compile_args = options['COMPILE_FLAGS'] + \
+        tf_compile_flags
+    tensorflow_mpi_lib.extra_link_args = options['LINK_FLAGS'] + tf_link_flags
+    tensorflow_mpi_lib.library_dirs = options['LIBRARY_DIRS']
+    tensorflow_mpi_lib.libraries = options['LIBRARIES']
+
+    build_ext.build_extension(tensorflow_mpi_lib)
+
+
+def parse_version(version_str):
+    m = re.match('^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?', version_str)
+    if m is None:
+        return None
+
+    # turn version string to long integer
+    version = int(m.group(1)) * 10 ** 9
+    if m.group(2) is not None:
+        version += int(m.group(2)) * 10 ** 6
+    if m.group(3) is not None:
+        version += int(m.group(3)) * 10 ** 3
+    if m.group(4) is not None:
+        version += int(m.group(4))
+    return version
+
+
+def dummy_import_torch():
+    try:
+        import torch
+    except:
+        pass
+
+
+def check_torch_version():
+    try:
+        import torch
+    except ImportError:
+        raise DistutilsPlatformError(
+            'import torch failed, is it installed?\n\n%s' % traceback.format_exc())
+
+    # parse version
+    version = parse_version(torch.__version__)
+    if version is None:
+        raise DistutilsPlatformError(
+            'Unable to determine PyTorch version from the version string \'%s\'' % torch.__version__)
+    return version
+
+
+def is_torch_cuda():
+    try:
+        from torch.utils.ffi import create_extension
+        cuda_test_ext = create_extension(
+            name='horovod.torch.test_cuda',
+            headers=['horovod/torch/dummy.h'],
+            sources=[],
+            with_cuda=True,
+            extra_compile_args=['-std=c11', '-fPIC', '-O2']
+        )
+        cuda_test_ext.build()
+        return True
+    except:
+        print('INFO: Above error indicates that this PyTorch installation does not support CUDA.')
+        return False
+
+
+def check_macro(macros, key):
+    return any(k == key and v for k, v in macros)
+
+
+def set_macro(macros, key, new_value):
+    if any(k == key for k, _ in macros):
+        return [(k, new_value if k == key else v) for k, v in macros]
+    else:
+        return macros + [(key, new_value)]
+
+
+class protect_files(object):
+    def __init__(self, *files):
+        self.files = files
+
+    def __enter__(self):
+        for file in self.files:
+            os.rename(file, file + '.protected')
+
+    def __exit__(self, type, value, traceback):
+        for file in self.files:
+            os.rename(file + '.protected', file)
+
+
+def build_torch_extension(build_ext, options):
+    torch_version = check_torch_version()
+
+    have_cuda = is_torch_cuda()
+    if not have_cuda and check_macro(options['MACROS'], 'HAVE_CUDA'):
+        raise DistutilsPlatformError(
+            'Horovod build with GPU support was requested, but this PyTorch '
+            'installation does not support CUDA.')
+
+    # Update HAVE_CUDA to mean that PyTorch supports CUDA. Internally, we will be checking
+    # HOROVOD_GPU_(ALLREDUCE|ALLGATHER|BROADCAST) to decide whether we should use GPU
+    # version or transfer tensors to CPU memory for those operations.
+    updated_macros = set_macro(
+        options['MACROS'], 'HAVE_CUDA', str(int(have_cuda)))
+
+    # Export TORCH_VERSION equal to our representation of torch.__version__. Internally it's
+    # used for backwards compatibility checks.
+    updated_macros = set_macro(updated_macros, 'TORCH_VERSION', str(torch_version))
+
+    # Create_extension overwrites these files which are customized, we need to protect them.
+    with protect_files('horovod/torch/mpi_lib/__init__.py',
+                       'horovod/torch/mpi_lib_impl/__init__.py'):
+        from torch.utils.ffi import create_extension
+        ffi_iface = create_extension(
+            name='horovod.torch.mpi_lib',
+            headers=['horovod/torch/interface.h'] +
+            (['horovod/torch/interface_cuda.h'] if have_cuda else []),
+            with_cuda=have_cuda,
+            language='c',
+            package=True,
+            sources=[],
+            extra_compile_args=['-std=c11', '-fPIC', '-O2']
+        )
+        ffi_impl = create_extension(
+            name='horovod.torch.mpi_lib_impl',
+            headers=[],
+            with_cuda=have_cuda,
+            language='c++',
+            package=True,
+            source_extension='.cc',
+            define_macros=updated_macros,
+            include_dirs=options['INCLUDES'],
+            sources=options['SOURCES'] + ['horovod/torch/mpi_ops.cc',
+                                          'horovod/torch/handle_manager.cc',
+                                          'horovod/torch/ready_event.cc',
+                                          'horovod/torch/tensor_util.cc',
+                                          'horovod/torch/cuda_util.cc',
+                                          'horovod/torch/adapter.cc'],
+            extra_compile_args=options['COMPILE_FLAGS'],
+            extra_link_args=options['LINK_FLAGS'],
+            library_dirs=options['LIBRARY_DIRS'],
+            libraries=options['LIBRARIES']
+        )
+
+    for ffi, setuptools_ext in [(ffi_iface, torch_mpi_lib),
+                                (ffi_impl, torch_mpi_lib_impl)]:
+        ffi_ext = ffi.distutils_extension()
+        # ffi_ext is distutils Extension, not setuptools Extension
+        for k, v in ffi_ext.__dict__.items():
+            setuptools_ext.__dict__[k] = v
+        build_ext.build_extension(setuptools_ext)
 
 
 # run the customize_compiler
 class custom_build_ext(build_ext):
     def build_extensions(self):
-        fully_define_extension(self)
-        build_ext.build_extensions(self)
+        options = get_common_options(self)
+        built_plugins = []
+        # If PyTorch is installed, it must be imported before TensorFlow, otherwise
+        # we may get an error: dlopen: cannot load any more object with static TLS
+        dummy_import_torch()
+        if not os.environ.get('HOROVOD_WITHOUT_TENSORFLOW'):
+            try:
+                build_tf_extension(self, options)
+                built_plugins.append(True)
+            except:
+                if not os.environ.get('HOROVOD_WITH_TENSORFLOW'):
+                    print('INFO: Unable to build TensorFlow plugin, will skip it.\n\n'
+                          '%s' % traceback.format_exc(), file=sys.stderr)
+                    built_plugins.append(False)
+                else:
+                    raise
+        if not os.environ.get('HOROVOD_WITHOUT_PYTORCH'):
+            try:
+                build_torch_extension(self, options)
+                built_plugins.append(True)
+            except:
+                if not os.environ.get('HOROVOD_WITH_PYTORCH'):
+                    print('INFO: Unable to build PyTorch plugin, will skip it.\n\n'
+                          '%s' % traceback.format_exc(), file=sys.stderr)
+                    built_plugins.append(False)
+                else:
+                    raise
+        if not built_plugins:
+            raise DistutilsError(
+                'Both TensorFlow and PyTorch plugins were excluded from build. Aborting.')
+        if not any(built_plugins):
+            raise DistutilsError(
+                'Neither TensorFlow nor PyTorch plugins were built. See errors above.')
 
 
 setup(name='horovod',
       version=__version__,
       packages=find_packages(),
-      description='Distributed training framework for TensorFlow.',
+      description='Distributed training framework for TensorFlow, Keras, and PyTorch.',
       author='Uber Technologies, Inc.',
       long_description=textwrap.dedent('''\
-          Horovod is a distributed training framework for TensorFlow. 
-          The goal of Horovod is to make distributed Deep Learning
-          fast and easy to use.'''),
+          Horovod is a distributed training framework for TensorFlow, Keras, and PyTorch.
+          The goal of Horovod is to make distributed Deep Learning fast and easy to use.'''),
       url='https://github.com/uber/horovod',
       classifiers=[
           'License :: OSI Approved :: Apache Software License'
       ],
-      ext_modules=[tensorflow_mpi_lib],
+      ext_modules=[tensorflow_mpi_lib, torch_mpi_lib, torch_mpi_lib_impl],
       cmdclass={'build_ext': custom_build_ext},
+      # cffi is required for PyTorch
+      # If cffi is specified in setup_requires, it will need libffi to be installed on the machine,
+      # which is undesirable.  Luckily, `install` action will install cffi before executing build,
+      # so it's only necessary for `build*` or `bdist*` actions.
+      setup_requires=['cffi>=1.4.0'] if is_build_action() else [],
+      install_requires=['cffi>=1.4.0'],
       zip_safe=False)

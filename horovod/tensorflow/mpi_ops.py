@@ -19,25 +19,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import ctypes
 import re
-import sysconfig
+import tensorflow as tf
 from tensorflow.python.framework import load_library
 from tensorflow.python.framework import ops
 from tensorflow.python.platform import resource_loader
 
-
-def _get_ext_suffix():
-    """Determine library extension for various versions of Python."""
-    ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
-    if ext_suffix:
-        return ext_suffix
-
-    ext_suffix = sysconfig.get_config_var('SO')
-    if ext_suffix:
-        return ext_suffix
-
-    return '.so'
+from horovod.common import get_ext_suffix
+from horovod.common import HorovodBasics as _HorovodBasics
 
 
 def _load_library(name, op_list=None):
@@ -65,63 +54,19 @@ def _load_library(name, op_list=None):
     return library
 
 
-def _load_ctypes_dll(name):
-    filename = resource_loader.get_path_to_datafile(name)
-    return ctypes.CDLL(filename, mode=ctypes.RTLD_GLOBAL)
-
-
-MPI_LIB = _load_library('mpi_lib' + _get_ext_suffix(),
+MPI_LIB = _load_library('mpi_lib' + get_ext_suffix(),
                         ['HorovodAllgather', 'HorovodAllreduce'])
 
+_basics = _HorovodBasics(__file__, 'mpi_lib')
 
-MPI_LIB_CTYPES = _load_ctypes_dll('mpi_lib' + _get_ext_suffix())
-
-
-def init():
-    """A function which initializes Horovod.
-    """
-    return MPI_LIB_CTYPES.horovod_tensorflow_init()
-
-
-def size():
-    """A function which returns the number of Horovod processes.
-
-    Returns:
-      An integer scalar containing the number of Horovod processes.
-    """
-    size = MPI_LIB_CTYPES.horovod_tensorflow_size()
-    if size == -1:
-        raise ValueError(
-            'Horovod has not been initialized; use horovod.tensorflow.init().')
-    return size
-
-
-def rank():
-    """A function which returns the Horovod rank of the calling process.
-
-    Returns:
-      An integer scalar with the Horovod rank of the calling process.
-    """
-    rank = MPI_LIB_CTYPES.horovod_tensorflow_rank()
-    if rank == -1:
-        raise ValueError(
-            'Horovod has not been initialized; use horovod.tensorflow.init().')
-    return rank
-
-
-def local_rank():
-    """A function which returns the local Horovod rank of the calling process, within the
-    node that it is running on. For example, if there are seven processes running
-    on a node, their local ranks will be zero through six, inclusive.
-
-    Returns:
-      An integer scalar with the local Horovod rank of the calling process.
-    """
-    local_rank = MPI_LIB_CTYPES.horovod_tensorflow_local_rank()
-    if local_rank == -1:
-        raise ValueError(
-            'Horovod has not been initialized; use horovod.tensorflow.init().')
-    return local_rank
+# import basic methods
+init = _basics.init
+shutdown = _basics.shutdown
+size = _basics.size
+local_size = _basics.local_size
+rank = _basics.rank
+local_rank = _basics.local_rank
+mpi_threads_supported = _basics.mpi_threads_supported
 
 
 def _normalize_name(name):
@@ -145,7 +90,18 @@ def _allreduce(tensor, name=None):
     return MPI_LIB.horovod_allreduce(tensor, name=name)
 
 
-ops.NotDifferentiable('HorovodAllreduce')
+@ops.RegisterGradient('HorovodAllreduce')
+def _allreduce_grad(op, grad):
+    """Gradient for allreduce op.
+
+    Args:
+      op: An operation.
+      grad: `Tensor` gradient with respect to the output of the op.
+
+    Returns:
+      The gradient with respect to the input of the op.
+    """
+    return _allreduce(grad)
 
 
 def allgather(tensor, name=None):
@@ -167,7 +123,28 @@ def allgather(tensor, name=None):
     return MPI_LIB.horovod_allgather(tensor, name=name)
 
 
-ops.NotDifferentiable('HorovodAllgather')
+@ops.RegisterGradient('HorovodAllgather')
+def _allgather_grad(op, grad):
+    """Gradient for allgather op.
+
+    Args:
+      op: An operation.
+      grad: `Tensor` gradient with respect to the output of the op.
+
+    Returns:
+      The gradient with respect to the input of the op.
+    """
+    grad = _allreduce(grad)
+
+    x = op.inputs[0]
+    d0 = x.get_shape().as_list()[0]
+    d = tf.convert_to_tensor([d0], dtype=tf.int32)
+
+    s = size()
+    d = tf.reshape(allgather(d), [s])
+
+    splits = tf.split(grad, num_or_size_splits=d, axis=0)
+    return splits[rank()]
 
 
 def broadcast(tensor, root_rank, name=None):
@@ -187,4 +164,19 @@ def broadcast(tensor, root_rank, name=None):
     return MPI_LIB.horovod_broadcast(tensor, name=name, root_rank=root_rank)
 
 
-ops.NotDifferentiable('HorovodBroadcast')
+@ops.RegisterGradient('HorovodBroadcast')
+def _broadcast_grad(op, grad):
+    """Gradient for broadcast op.
+
+    Args:
+      op: An operation.
+      grad: `Tensor` gradient with respect to the output of the op.
+
+    Returns:
+      The gradient with respect to the input of the op.
+    """
+    root_rank = op.get_attr('root_rank')
+    grad_reduced = _allreduce(grad)
+    if rank() != root_rank:
+        return grad_reduced * 0
+    return grad_reduced
